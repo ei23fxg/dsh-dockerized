@@ -50,6 +50,26 @@
   (`dsh -m FILE…`) gelten die Versteck-Regeln nicht — mounte bewusst nur,
   was offen sein soll.
 
+## Read-only-Projekt-Mount (`-ro`)
+
+- **Was:** `dsh -ro -m` (ganzes Projekt), `dsh -ro -m FILE…` (jede Datei einzeln),
+  `DSHD_READ_ONLY=1` als Env — der Workspace-Bind bekommt `:ro`, erzwungen von
+  Docker, nicht per Prompt.
+- **Bewusst weiter beschreibbar:** `~/dsh-home`, `~/.dsh`, Session-Mounts und
+  `mounts.conf`-Ziele — sonst könnten Sessions nicht gespeichert werden.
+- **Git-Auto-Init** wird bei `-ro` übersprungen (das Repo würde ins ro-Projekt
+  gelegt). Bestehende `.git`-Ordner im Projekt bleiben natürlich sichtbar.
+- **`-ro` ohne `-m`** ist wirkungslos: Warnung, keine Env-Var im Container.
+- **Abgrenzung `mounts.conf`:** Das Projekt selbst kann dort nicht auf `:ro`
+  gestellt werden (`DSHD_WORK_DIR` ist reserviertes Mount-Ziel); dafür ist `-ro`
+  der vorgesehene Weg. `:ro` in `mounts.conf` bleibt für Zusatz-Verzeichnisse.
+- **Bestands-`~/.dsh`:** Der Seed wird nie überschrieben — der
+  Prompt-Hinweis („keine Workarounds, Änderungen als Diff“) fehlt in alten
+  `cordis.patch.yml`; bei Bedarf aus `examples/dsh/cordis.patch.yml` übernehmen.
+- **Offener Host-Test:** verschachtelte Versteck-Mounts (Empty-Dir//dev/null)
+  unter einem ro-Elternbind — erwartet funktionierend, auf dem ersten echten
+  Docker-Host gegenprüfen.
+
 ## Berechtigungen
 
 - Der Container läuft mit deiner Host-UID/GID. Root-Eigentum in `~/.dsh`

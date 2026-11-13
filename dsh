@@ -75,6 +75,11 @@ DSHD_ALLOW_GIT="${DSHD_ALLOW_GIT:-1}"
 DSHD_GIT_AUTOINIT="${DSHD_GIT_AUTOINIT:-1}"
 # "dsh --show-hidden": standardmäßig versteckte Projektdateien sichtbar.
 DSHD_SHOW_HIDDEN="${DSHD_SHOW_HIDDEN:-0}"
+# "dsh -ro": den per -m gemounteten Workspace (ganzes Projekt oder DATEI…)
+# read-only ins Container-Dateisystem. Bewusst weiter beschreibbar: ~/dsh-home,
+# ~/.dsh, Session-Mounts und mounts.conf-Ziele — sonst können Sessions nicht
+# gespeichert werden. Ohne -m wirkungslos (Warnung).
+DSHD_READ_ONLY="${DSHD_READ_ONLY:-0}"
 
 # Git-Identität aus der Host-Konfiguration (ohne kann git nicht committen).
 DSHD_GIT_NAME="${DSHD_GIT_NAME:-$(git config --global user.name 2>/dev/null || true)}"
@@ -435,6 +440,17 @@ run_dsh() {
 
     bootstrap_environment
 
+    # Read-only gilt nur für den gemounteten Workspace; festes Home und raw
+    # (plugin/Help) bleiben wie gehabt beschreibbar.
+    if [[ "${DSHD_READ_ONLY}" == "1" ]]; then
+        if [[ "$mode" != "boot" || "${DSHD_MOUNT_CWD}" != "1" ]]; then
+            echo "Warning: dsh: -ro needs a mounted workspace ('-m'); fixed home ~/dsh-home and raw mode stay writable." >&2
+            DSHD_READ_ONLY=0
+        fi
+    fi
+    local ro_suffix=""
+    [[ "${DSHD_READ_ONLY}" == "1" ]] && ro_suffix=":ro"
+
     # Web-Standardflags: kein Browser-Open (Container), fester Port, Host-Localhost
     local -a boot_args=("$@")
     if [[ "$mode" == "boot" && "$profile" == "web" ]]; then
@@ -522,9 +538,15 @@ run_dsh() {
     DOCKER_ARGS+=(-e "GIT_AUTHOR_NAME=${git_name}" -e "GIT_COMMITTER_NAME=${git_name}"
         -e "GIT_AUTHOR_EMAIL=${git_email}" -e "GIT_COMMITTER_EMAIL=${git_email}")
 
-    # Git-Auto-Init nur bei vollem Projekt-Mount
-    if [[ "${DSHD_MOUNT_CWD}" == "1" && "${DSHD_SELECTIVE}" != "1" && "${DSHD_ALLOW_GIT}" == "1" && "${DSHD_GIT_AUTOINIT}" == "1" ]]; then
+    # Git-Auto-Init nur bei vollem Projekt-Mount; bei read-only würde das
+    # Repo ins ro-Projekt gelegt — also überspringen.
+    if [[ "${DSHD_MOUNT_CWD}" == "1" && "${DSHD_SELECTIVE}" != "1" && "${DSHD_ALLOW_GIT}" == "1" && "${DSHD_GIT_AUTOINIT}" == "1" && "${DSHD_READ_ONLY}" != "1" ]]; then
         DOCKER_ARGS+=(-e "DSHD_GIT_AUTOINIT=1")
+    fi
+
+    # Dem Agenten im Container mitteilen (Seed-Hinweis im Home-Patch nutzts).
+    if [[ "${DSHD_READ_ONLY}" == "1" ]]; then
+        DOCKER_ARGS+=(-e "DSHD_READ_ONLY=1")
     fi
 
     # Arbeitsverzeichnis: nur mit -m gemountet (voll oder selektiv)
@@ -533,10 +555,10 @@ run_dsh() {
             DOCKER_ARGS+=(-v "${DSHD_FILES_ROOT}:${DSHD_WORK_DIR}")
             local i
             for ((i = 0; i < ${#DSHD_MOUNT_FILE_HOSTS[@]}; i++)); do
-                DOCKER_ARGS+=(-v "${DSHD_MOUNT_FILE_HOSTS[$i]}:${DSHD_WORK_DIR}/${DSHD_MOUNT_FILE_TARGETS[$i]}")
+                DOCKER_ARGS+=(-v "${DSHD_MOUNT_FILE_HOSTS[$i]}:${DSHD_WORK_DIR}/${DSHD_MOUNT_FILE_TARGETS[$i]}${ro_suffix}")
             done
         else
-            DOCKER_ARGS+=(-v "$(pwd):${DSHD_WORK_DIR}")
+            DOCKER_ARGS+=(-v "$(pwd):${DSHD_WORK_DIR}${ro_suffix}")
 
             # Versteckte Dateien via /dev/null-Mounts verbergen (wie beim Pi-Wrapper)
             if [[ "${DSHD_SHOW_HIDDEN}" != "1" ]]; then
@@ -616,6 +638,11 @@ while [[ -n "${DSHD_COMMAND}" ]]; do
             if (( ${#DSHD_MOUNT_FILE_HOSTS[@]} > 0 )); then
                 setup_selective_mounts
             fi
+            DSHD_COMMAND="${1:-}"
+            ;;
+        -ro|--read-only)
+            DSHD_READ_ONLY=1
+            shift
             DSHD_COMMAND="${1:-}"
             ;;
         --show-hidden|show-hidden)

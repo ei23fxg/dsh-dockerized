@@ -28,6 +28,7 @@ host. DSH does not currently ship an interactive TUI profile; for terminal work 
 |---|---|
 | `dsh` | Fixed working home `~/dsh-home`, web UI on port 3080 |
 | `dsh -m` | Mounts the current directory as workspace (web UI) |
+| `dsh -ro -m` | Same, but workspace mounted **read-only** |
 | `dsh -m README.md "MY FILE.md"` | Mounts only these files; everything else stays on the host |
 | `dsh headless "prompt"` | One-shot task in the fixed home (prints the result, exits) |
 | `dsh -m headless "prompt"` | One-shot task in the current project |
@@ -38,9 +39,17 @@ host. DSH does not currently ship an interactive TUI profile; for terminal work 
 | `dsh --show-hidden -m` | One-off: show all project files hidden by default |
 | `dsh rebuild` | Rebuild the image (`DSHD_VERSION=0.2.3 dsh rebuild` pins a version) |
 
-- `-m`, `--show-hidden` and `rebuild` are wrapper flags; everything else is passed through
+- `-m`, `-ro`, `--show-hidden` and `rebuild` are wrapper flags; everything else is passed through
   unchanged to `dsh` inside the container. After `-m`, a bare `web` always means web start, never
   a path — a folder named `web` gets mounted as `./web`.
+- **Read-only mode (`-ro`)** — order-flexible (`dsh -ro -m`, `dsh -m -ro`, also with
+  `dsh -ro -m FILE…`): the workspace bind gets `:ro`, enforced by Docker, not by prompting. The
+  container sees `DSHD_READ_ONLY=1` and the seeded prompt tells the agent not to fight it — expect
+  changes as diffs, scratch files go to `$HOME`. Deliberately still writable: `~/dsh-home`,
+  `~/.dsh`, session storage and `mounts.conf` targets (sessions must persist). Git auto-init is
+  skipped (the repo would land inside the read-only project); `-ro` without `-m` prints a warning
+  and does nothing. For pre-existing `~/.dsh` the prompt hint is not added automatically — copy it
+  from [`examples/dsh/cordis.patch.yml`](examples/dsh/cordis.patch.yml).
 - Each session belongs to its context (fixed home vs. one session folder per project); you never
   see sessions from other projects — DSH stores sessions by workspace path
   (`~/.dsh/sessions/--<encoded path>--`), and the wrapper isolates that via a session-root mount.
@@ -117,6 +126,7 @@ export DSHD_ALLOW_GIT=0    # all future starts
 | `DSHD_GIT_NAME` / `DSHD_GIT_EMAIL` | host values | commit identity inside the container |
 | `DSHD_HOME_DIR` | `~/dsh-home` | host source directory of the fixed working home |
 | `DSHD_MOUNT_CWD` | `0` | `1` behaves like `dsh -m` always |
+| `DSHD_READ_ONLY` | `0` | `1` behaves like `dsh -ro` (read-only `-m` workspace) |
 | `DSHD_MOUNTS_FILE` | `~/.dsh/mounts.conf` | location of the extra-mounts file |
 | `DSHD_PORT` | `3080` | web UI port |
 | `DSHD_OPEN_BROWSER` | `0` | `1` drops `--no-open` (little use inside the container) |

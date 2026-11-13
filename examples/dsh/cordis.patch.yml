@@ -46,6 +46,10 @@
       - Nur dieser Workspace und die expliziten Mounts sind sichtbar.
       - Nutze 'uv' für Python und 'pnpm' für Node.js.
       - Kein git push (keine Credentials im Container); lokal committen ist ok.
+      - Ist DSHD_READ_ONLY=1 gesetzt, ist der Workspace read-only gemountet:
+        keine Workarounds suchen (keine Projektkopien, keine Umwege über
+        Temp-Verzeichnisse); Änderungen als Diff präsentieren, Scratch-Dateien
+        nach $HOME legen.
 
 # 5. Beispiel: lokales LLM via OpenAI-kompatiblem Endpoint ("strata") +
 #    Standardmodell; DeepSeek-eigene Modelle abgeschaltet.
