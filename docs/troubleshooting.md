@@ -28,8 +28,17 @@
   dort. Von anderswo tunneln:
   `ssh -N -L 3080:127.0.0.1:3080 user@dockerhost`.
 - **`EADDRINUSE` / Port belegt:** Ein anderer Kontext läuft schon auf 3080.
-  `DSHD_PORT=3081 dsh -m web` (der Wrapper reicht `--port` nur durch, wenn du
-  nicht selbst einen angibst).
+  Aktuelle Wrapper-Version: **fehlerhafte Starts werden vorab abgefangen**
+  (klare Fehlermeldung, kein Container). Ältere Versionen: der neue Container
+  startet, DSH stürzt mit EADDRINUSE ab, `--rm` löscht ihn — die gedruckte URL
+  zeigt dann auf den **Alt-Container** (falscher Workspace, fehlend geglaubte
+  Mounts = Symptome dieses Falls). Lösen: anderen Kontext stoppen oder
+  `DSHD_PORT=3081 dsh -m web`.
+- **Mounts fehlen trotz richtiger Konfiguration?** `DSHD_DEBUG=1 dsh -m`
+  druckt das exakte `docker run` mit allen `-v`-Einträgen. Häufigste Ursachen:
+  Wrapper aus einer Umgebung heraus gestartet, die dem Docker-Daemon fremde
+  Pfade zeigt (Container/SSH-Host ≠ Daemon-Host — Daemon legt fehlende
+  Quellpfade leer an), oder `mounts.conf` nicht gefunden (anderes `$HOME`).
 - **WEB_PROVIDER_AMBIGUOUS:** Dein `cordis.patch.yml`-`web`-Eintrag muss
   `fetchProvider` mitsetzen (siehe Vorlage) — ein Patch ersetzt die ganze
   Config der Zeile.

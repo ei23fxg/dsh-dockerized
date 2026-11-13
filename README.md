@@ -133,6 +133,7 @@ export DSHD_ALLOW_GIT=0    # all future starts
 | `DSHD_EXTRA_ENV` | `DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME` | host env var names to pass through |
 | `DSHD_VERSION` | `latest` | DSH version baked into the image (change ⇒ rebuild) |
 | `DSHD_RUST_VERSION` | `stable` | Rust toolchain in the image (change ⇒ rebuild) |
+| `DSHD_DEBUG` | `0` | `1` prints the exact `docker run` command (all mounts/envs) before starting |
 
 ## Disabling telemetry — completely
 
@@ -215,6 +216,10 @@ being used — the container writes into the same structure.
 - **First start is slow?** Normal — image build. A later rebuild means: build cache/label changed
   or the image was pruned. Details: [docs/troubleshooting.md](docs/troubleshooting.md).
 - **Port taken?** Two web contexts in parallel → use different `DSHD_PORT` values.
+  The wrapper pre-checks the port and aborts with a hint; if the wrong container
+  seems to be showing (missing folder/mounts), an older build had crashed on
+  EADDRINUSE and the URL belonged to the other context — see
+  [docs/troubleshooting.md](docs/troubleshooting.md).
 - **Session history empty?** You are booting in a different context (fixed home vs. `-m` project);
   sessions are separated per workspace.
 - `Warning: dsh-entrypoint: …` on first start = a fresh profile is being initialized (network needed).

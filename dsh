@@ -65,6 +65,8 @@ DSHD_RUST_VERSION="${DSHD_RUST_VERSION:-stable}"
 # davor konnte ein 711/600-Build-Kontext den Entrypoint im Image unlesepbar machen).
 DSHD_BUILD_STAMP="2-${DSHD_VERSION}-${DSHD_RUST_VERSION}"
 
+# Debug: DSHD_DEBUG=1 druckt das exakte docker-run-Kommando (Mounts/Env prüfen).
+DSHD_DEBUG="${DSHD_DEBUG:-0}"
 # Web-UI (Standardstart): fester Port; Host-Network, URL erscheint im Terminal.
 DSHD_PORT="${DSHD_PORT:-3080}"
 DSHD_OPEN_BROWSER="${DSHD_OPEN_BROWSER:-0}"
@@ -461,6 +463,20 @@ run_dsh() {
         [[ "$has_port" == "0" ]] && boot_args+=(--port "${DSHD_PORT}")
         [[ "$DSHD_OPEN_BROWSER" != "1" ]] && boot_args+=(--no-open)
         boot_args+=(--trusted-host localhost --trusted-host 127.0.0.1)
+
+        # Vorabprüfung Port: DSH hat keinen EADDRINUSE-Fallback — sonst stürzt
+        # der Container still ab und die gedruckte URL gehört zum Alt-Container.
+        local check_port="${DSHD_PORT}" seen_port=0
+        for arg in "${boot_args[@]}"; do
+            [[ "$seen_port" == "1" ]] && { check_port="$arg"; break; }
+            [[ "$arg" == "--port" ]] && seen_port=1
+        done
+        if (exec 3<>"/dev/tcp/127.0.0.1/${check_port}") 2>/dev/null; then
+            exec 3>&- 3<&-
+            echo "Error: dsh: port ${check_port} is already in use — likely another dsh web context (fixed home and each -m project are separate contexts)." >&2
+            echo "Hint: stop the other context, or start this one on another port: DSHD_PORT=3081 dsh -m … (or 'web --port 3081')." >&2
+            return 1
+        fi
     fi
 
     local run_dir session_parent session_dir session_key container_name
@@ -587,6 +603,13 @@ run_dsh() {
 
     # Startbefehl: Profil-Fix (SearXNG) + Git-Auto-Init + exec dsh.
     # Argumente bleiben echte Argumente (Leerzeichen/Quotes in Prompts ok).
+    if [[ "${DSHD_DEBUG}" == "1" ]]; then
+        local dbg
+        printf 'dsh[debug]: docker run' >&2
+        for dbg in "${DOCKER_ARGS[@]}"; do printf ' [%s]' "$dbg" >&2; done
+        printf ' [%s] …\n' "${DSHD_IMAGE}" >&2
+    fi
+
     docker run "${DOCKER_ARGS[@]}" "${DSHD_IMAGE}" \
         /bin/sh -c 'cd "$1" || exit 1
 shift
