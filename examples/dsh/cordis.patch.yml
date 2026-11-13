@@ -1,0 +1,76 @@
+# Deine Patch-Ebene für alle DSH-Profile (Home-Ebene, wird NACH jeder Profil-
+# Ebene angewandt): eine YAML-Liste von Loader-Patch-Einträgen (id-gerichtete
+# Config-Overrides, disables, insert-Listen; `!!js`-Ausdrücke erlaubt).
+# Diese Datei wird nur angelegt, wenn ~/.dsh/cordis.patch.yml noch nicht
+# existiert — bestehende Dateien werden nie überschrieben.
+#
+# 1. SearXNG-Provider konfigurieren (Adresse ggf. anpassen)
+- id: web-search-searxng
+  config:
+    baseURL: "http://10.1.1.11:4002"
+
+# 2. Das Haupt-Webtool anweisen, SearXNG statt DeepSeek zu nutzen.
+#    Der Patch ersetzt die komplette config der Zeile: fetchProvider muss
+#    mit aufgeführt werden, sonst sind http und deepseek-fetch-api beide
+#    verfügbar und web_fetch meldet WEB_PROVIDER_AMBIGUOUS.
+- id: web
+  config:
+    searchProvider: "searxng"
+    fetchProvider: "http"
+
+# 3. Datenschutz: Telemetrie/Analytics komplett aus
+- id: session-telemetry-otel
+  disabled: true
+- id: otel                              # gemeinsamer OTLP-Transport
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek # hängt Plugin-Liste an Requests
+  disabled: true
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true
+- id: command-feedback                  # optional; entfernt die Rating-Buttons
+  disabled: true
+- id: message-feedback
+  disabled: true
+- id: ui-message-feedback
+  disabled: true
+
+# 4. System-Prompt-Zusatz für den Agenten (Container-Hinweise)
+- id: agent
+  config:
+    systemPrompt: |
+      Du arbeitest in einer Docker-Entwicklungsumgebung (dsh-dockerized).
+      - Nur dieser Workspace und die expliziten Mounts sind sichtbar.
+      - Nutze 'uv' für Python und 'pnpm' für Node.js.
+      - Kein git push (keine Credentials im Container); lokal committen ist ok.
+
+# 5. Beispiel: lokales LLM via OpenAI-kompatiblem Endpoint ("strata") +
+#    Standardmodell; DeepSeek-eigene Modelle abgeschaltet.
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      strata:
+        displayName: Strata
+        api: openai-completions
+        baseURL: http://127.0.0.1:8085/v1
+        models:
+          - id: qwen3.8-flash-next-iq3_s
+            name: qwen3.8-flash-next-iq3_s
+            contextWindow: 256000
+            input:
+              - text
+              - image
+        apiKeyEnv: STRATA_API_KEY
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: strata
+    model: qwen3.8-flash-next-iq3_s
+- id: llm-deepseek
+  name: "@deepseek-ai/dsh-llm-deepseek-api-key"
+  config:
+    models: []
