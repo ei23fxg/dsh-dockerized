@@ -52,7 +52,9 @@ host. DSH does not currently ship an interactive TUI profile; for terminal work 
   from [`examples/dsh/cordis.patch.yml`](examples/dsh/cordis.patch.yml).
 - Each session belongs to its context (fixed home vs. one session folder per project); you never
   see sessions from other projects — DSH stores sessions by workspace path
-  (`~/.dsh/sessions/--<encoded path>--`), and the wrapper isolates that via a session-root mount.
+  (`~/.dsh/sessions/--<encoded path>--`), and the wrapper hides foreign session folders with
+  empty-directory overlays. Storage always stays on the `~/.dsh` filesystem (DSH's persistence
+  uses hardlink/rename and must not cross mount boundaries).
 
 ## Web UI
 

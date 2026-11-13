@@ -53,6 +53,13 @@
   Hash des Host-Pfads — derselbe Projektordner am selben Platz = derselbe Key.
   Projekt verschoben/umbenannt → neuer Key, alte Sessions bleiben unter dem
   alten Namen erhalten.
+- **`-m`-Sessions waren vor dem 2026-11-13 leer/nicht persistent:** Die alte
+  Session-Isolation legte einen tmp-Overlay über den Sessions-Root und mountete
+  den Projekt-Key zusätzlich verschachtelt — DSHs Persistenz (Hardlink/rename)
+  konnte so nicht sauber schreiben; in `-m`-Kontexten erzeugte Sessions gingen
+  verloren. Behoben: Isolation jetzt per Leerverzeichnis-Mounts auf fremde
+  Keys, Sessions-Root bleibt normales Unterverzeichnis von `~/.dsh`. Bereits
+  verlorene `-m`-Sessions lassen sich nicht rekonstruieren.
 - **Datei sieht der Agent nicht:** Sie steckt in der Versteck-Liste
   (`.env`, `.dsh`, Ignore-Dateien …). Einmalig zeigen: `dsh --show-hidden -m`.
 - **`.env` versehentlich gemountet:** Bei selektiven Datei-Mounts
