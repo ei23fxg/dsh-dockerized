@@ -118,12 +118,17 @@ DSHD_NETWORK_MODE="host"
 
 DSHD_DEFAULT_IGNORED_FILES=(.env .deploy .secret .git .build .vscode .gitmodules .gitignore .dsh .aiignore .aiexclude .copilotignore .geminiignore .codeiumignore .cursorignore .DS_Store)
 DSHD_EMPTY_DIR=$(mktemp -d)
+# Temporärer Sessions-Root, der nur das aktuelle Projekt enthält: über das
+# Mount von ~/.dsh/sessions gelegt, damit andere Projekte unsichtbar bleiben
+# (Pi-Wrapper-Muster). Das echte Key-Verzeichnis wird zusätzlich nachgebunden.
+DSHD_SESSION_PARENT=$(mktemp -d)
 # Enthält nur die Platzhalter-Dateien selektiver Datei-Mounts (Workspace-Root).
 DSHD_FILES_ROOT=$(mktemp -d)
+DSHD_SELECTIVE_SESSION_PARENT=$(mktemp -d)
 
 # shellcheck disable=SC2329  # wird über `trap cleanup EXIT` aufgerufen
 cleanup() {
-    rm -rf "$DSHD_EMPTY_DIR" "$DSHD_FILES_ROOT" 2>/dev/null || true
+    rm -rf "$DSHD_EMPTY_DIR" "$DSHD_SESSION_PARENT" "$DSHD_SELECTIVE_SESSION_PARENT" "$DSHD_FILES_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -144,7 +149,7 @@ dshd_session_key() {
 DSHD_WORK_SESSION_KEY="$(dshd_session_key "$DSHD_WORK_DIR")"
 DSHD_HOME_SESSION_KEY="$(dshd_session_key "$DSHD_HOME_CONTAINER")"
 DSHD_HOME_SESSION_DIR="${DSHD_FOLDER}/sessions/${DSHD_HOME_SESSION_KEY}"
-mkdir -p "${DSHD_HOME_SESSION_DIR}"
+mkdir -p "${DSHD_SESSION_PARENT}/${DSHD_WORK_SESSION_KEY}" "${DSHD_HOME_SESSION_DIR}"
 
 # ---------------------------------------------------------------------------
 # Helper: Docker Image bauen (Dockerfile ist ins Skript eingebettet;
@@ -387,6 +392,7 @@ setup_selective_mounts() {
     DSHD_WORK_DIR="/${PROJECT_SAFE_NAME}_files_${hash: -6}"
     DSHD_WORK_SESSION_KEY="$(dshd_session_key "$DSHD_WORK_DIR")"
     DSHD_CONTAINER_NAME="dsh-files-${hash}"
+    mkdir -p "${DSHD_SELECTIVE_SESSION_PARENT}/${DSHD_WORK_SESSION_KEY}"
 
     for target in "${DSHD_MOUNT_FILE_TARGETS[@]}"; do
         mkdir -p "${DSHD_FILES_ROOT}/$(dirname -- "${target}")"
@@ -473,14 +479,26 @@ run_dsh() {
         fi
     fi
 
-    local run_dir container_name
+    local run_dir session_parent session_dir session_key ctx_storages container_name
     if [[ "$mode" == "boot" ]]; then
         if [[ "${DSHD_MOUNT_CWD}" == "1" ]]; then
             run_dir="${DSHD_WORK_DIR}"
+            session_parent="${DSHD_SESSION_PARENT}"
+            session_dir="${DSHD_FOLDER}/sessions/${DSHD_WORK_SESSION_KEY}"
+            [[ "${DSHD_SELECTIVE}" == "1" ]] && session_parent="${DSHD_SELECTIVE_SESSION_PARENT}"
+            session_key="${DSHD_WORK_SESSION_KEY}"
             container_name="${DSHD_CONTAINER_NAME}"
-            mkdir -p "${DSHD_FOLDER}/sessions/${DSHD_WORK_SESSION_KEY}"
+            # Eigener Web-Storage pro -m-Kontext (persistente Registry statt
+            # geteiltem ~/.dsh/storages — mehrere DSH-Instanzen würden sich
+            # sonst in derselben workspace.json gegenseitig überschreiben).
+            ctx_storages="${DSHD_FOLDER}/contexts/${DSHD_WORK_SESSION_KEY}/storages"
+            mkdir -p "${session_dir}" "${ctx_storages}"
         else
             run_dir="${DSHD_HOME_CONTAINER}"
+            session_parent=""
+            session_dir=""
+            session_key=""
+            ctx_storages=""
             container_name="${DSHD_HOME_CONTAINER_NAME}"
         fi
     fi
@@ -530,20 +548,19 @@ run_dsh() {
 
     DOCKER_ARGS+=(--name "${container_name}")
 
-    # Session-Isolation im Projektmodus: Sessions-Root bleibt normaler Unterpfad
-    # des ~/.dsh-Mounts (gleiches Dateisystem wie im Fixed-Home — DSHs Persistenz
-    # arbeitet mit Hardlink/rename und darf nicht über Mount-Grenzen; der frühere
-    # tmp-Overlay verlor deshalb jedes Projektsession-Profil). Fremde Projekt-Keys
-    # werden per Leerverzeichnis-Mount unsichtbar gemacht.
-    if [[ "$mode" == "boot" && "${DSHD_MOUNT_CWD}" == "1" ]]; then
-        local sess_hidden_dir sess_hidden_key
-        for sess_hidden_dir in "${DSHD_FOLDER}/sessions"/*/; do
-            [[ -d "${sess_hidden_dir}" ]] || continue
-            sess_hidden_key="${sess_hidden_dir%/}"
-            sess_hidden_key="${sess_hidden_key##*/}"
-            [[ "${sess_hidden_key}" == "${DSHD_WORK_SESSION_KEY}" ]] && continue
-            DOCKER_ARGS+=(-v "${DSHD_EMPTY_DIR}:${DSHD_CONFIG_CONTAINER}/sessions/${sess_hidden_key}")
-        done
+    # Sessions: im Projektmodus nur die des aktuellen Kontexts sichtbar
+    # (tmp-Root mit nur dem eigenen Key darüber, echtes Key-Verzeichnis
+    # nachgebunden — Pi-Muster; schreibt DSH auch über Container-Neustarts
+    # hinweg in ~/.dsh/sessions/<key>).
+    if [[ -n "${session_parent}" ]]; then
+        DOCKER_ARGS+=(-v "${session_parent}:${DSHD_CONFIG_CONTAINER}/sessions")
+        DOCKER_ARGS+=(-v "${session_dir}:${DSHD_CONFIG_CONTAINER}/sessions/${session_key}")
+    fi
+
+    # Web-Registry/Storages pro Kontext isoliert (siehe oben): leer initialisiert
+    # baut DSH hier seine eigene workspace.json + Projections auf.
+    if [[ -n "${ctx_storages}" ]]; then
+        DOCKER_ARGS+=(-v "${ctx_storages}:${DSHD_CONFIG_CONTAINER}/storages")
     fi
 
     # Git-Identität immer durchreichen (sonst kann git nicht committen)

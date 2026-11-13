@@ -50,11 +50,14 @@ host. DSH does not currently ship an interactive TUI profile; for terminal work 
   skipped (the repo would land inside the read-only project); `-ro` without `-m` prints a warning
   and does nothing. For pre-existing `~/.dsh` the prompt hint is not added automatically — copy it
   from [`examples/dsh/cordis.patch.yml`](examples/dsh/cordis.patch.yml).
-- Each session belongs to its context (fixed home vs. one session folder per project); you never
+- Each session belongs to its context (fixed home vs. one context per `-m` project); you never
   see sessions from other projects — DSH stores sessions by workspace path
-  (`~/.dsh/sessions/--<encoded path>--`), and the wrapper hides foreign session folders with
-  empty-directory overlays. Storage always stays on the `~/.dsh` filesystem (DSH's persistence
-  uses hardlink/rename and must not cross mount boundaries).
+  (`~/.dsh/sessions/--<encoded path>--`); in `-m` mode the wrapper shows only the current
+  project's folder. Each `-m` context also gets its own persistent web storage
+  (`~/.dsh/contexts/--<key>--/storages`): DSH's web session registry
+  (`storages/workspace.json`) has no merge/locking — sharing one registry between concurrent
+  instances corrupts the session view, so registries are per-context by design (same idea as
+  the pi wrapper, adapted to DSH).
 
 ## Web UI
 
@@ -85,6 +88,7 @@ Created once, existing files are **never** overwritten (templates in
 ~/.dsh/cordis.patch.yml   # home-patch layer: SearXNG, telemetry off, model providers, system prompt
 ~/.dsh/AGENTS.md          # global instructions (DSH appends them to every session)
 ~/.dsh/mounts.conf        # persistent extra mounts + managed entry for ~/dsh-home
+~/.dsh/contexts/<key>/    # per `-m` context: web storage (session registry), created on first start
 ~/.dsh/<API_KEY>          # key files, e.g. ~/.dsh/STRATA_API_KEY (chmod 600)
 ```
 

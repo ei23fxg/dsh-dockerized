@@ -47,19 +47,25 @@
 
 ## Sessions & Isolation
 
+- **Web-UI zeigt im `-m` Sessions falsch/leer/gemischt (Stand vor 2026-11-13):**
+  Die Web-UI verwaltet ihre Sitzungs-Registry in
+  `~/.dsh/storages/workspace.json` (Workspaces + Session-Ids, keyed nach
+  Container-Pfad). Fixed-Home und `-m` teilten sich diese eine Datei: Der
+  `-m`-Start sah die Workspace-Einträge des Fixed-Homes, deren Session-Ordner
+  aber waren isoliert — die Liste wirkte defekt; bei Parallelbetrieb
+  überschrieben sich beide Instanzen in der Registry. Behoben: Jeder
+  `-m`-Kontext bekommt einen **eigenen persistenten** Storage unter
+  `~/.dsh/contexts/<session-key>/storages`, Sessions liegen wie gehabt in
+  `~/.dsh/sessions/<session-key>`. In `-m`-Kontexten vor dem Fix angelegte
+  Sessions wurden nie sauber persistiert und sind nicht rekonstruierbar.
+- **`-m` zeigt bewusst nur eigene Sessions:** Das ist Design wie beim
+  Pi-Wrapper — feste Home-World und jedes `-m`-Projekt sind getrennte
+  Welten (eigene Registry, eigener Sessions-Ausschnitt). Gewollte
+  Gesamtansicht → Festes Home verwenden und das Projekt via `mounts.conf`
+  mounten; dann erscheinen seine Sessions im Home-UI.
 - **Historie wirkt leer:** Sessions hängen am Workspace-Pfad
-  (`~/.dsh/sessions/--<encodierter Pfad>--`). Festes Home und jedes `-m`-Projekt
-  sind getrennte Kontexte; der Projektordnername im Container enthält einen
-  Hash des Host-Pfads — derselbe Projektordner am selben Platz = derselbe Key.
-  Projekt verschoben/umbenannt → neuer Key, alte Sessions bleiben unter dem
-  alten Namen erhalten.
-- **`-m`-Sessions waren vor dem 2026-11-13 leer/nicht persistent:** Die alte
-  Session-Isolation legte einen tmp-Overlay über den Sessions-Root und mountete
-  den Projekt-Key zusätzlich verschachtelt — DSHs Persistenz (Hardlink/rename)
-  konnte so nicht sauber schreiben; in `-m`-Kontexten erzeugte Sessions gingen
-  verloren. Behoben: Isolation jetzt per Leerverzeichnis-Mounts auf fremde
-  Keys, Sessions-Root bleibt normales Unterverzeichnis von `~/.dsh`. Bereits
-  verlorene `-m`-Sessions lassen sich nicht rekonstruieren.
+  (`~/.dsh/sessions/--<encodierter Pfad>--`). Projekt verschoben/umbenannt →
+  neuer Key, alte Sessions bleiben unter dem alten Namen erhalten.
 - **Datei sieht der Agent nicht:** Sie steckt in der Versteck-Liste
   (`.env`, `.dsh`, Ignore-Dateien …). Einmalig zeigen: `dsh --show-hidden -m`.
 - **`.env` versehentlich gemountet:** Bei selektiven Datei-Mounts
