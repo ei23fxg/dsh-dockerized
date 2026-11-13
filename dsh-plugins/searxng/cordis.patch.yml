@@ -1,0 +1,18 @@
+# Bundle-Patch dieses Plugins:
+# 1. registriert den SearXNG-Provider in der Web-Capability (ctx.web),
+# 2. wählt ihn als Suchprovider und pinnt den lokalen HTTP-Fetcher für
+#    web_fetch (sonst wären http und deepseek-fetch-api beide verfügbar).
+#
+# Die Instanz kommt aus `config.baseURL` oder SEARXNG_BASE_URL. Ohne baseURL
+# gilt der Provider als nicht verfügbar und wird nie ausgewählt.
+#
+# Provider-Id: searxng. Ein späterer Profil-Patch kann die `web`-Zeile
+# überschreiben (z. B. zurück auf deepseek-official).
+- insert:
+    - id: web-search-searxng
+      name: 'dsh-web-search-searxng'
+
+- id: web
+  config:
+    searchProvider: searxng
+    fetchProvider: http

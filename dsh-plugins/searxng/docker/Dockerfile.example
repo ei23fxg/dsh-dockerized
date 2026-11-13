@@ -1,0 +1,33 @@
+# Beispiel: die relevanten Zeilen für die eigene DSH-Dockerfile.
+# Voraussetzung: der Ordner `searxng-plugin/` liegt neben dieser Dockerfile
+# im Build-Context.
+
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g pnpm @deepseek-ai/dsh
+
+# --- SearXNG-Suchplugin: fest ins Image, nicht in den Workspace -------------
+# Stabiler Pfad, der von keinem Bind-Mount überdeckt wird.
+COPY searxng-plugin /opt/dsh-plugins/searxng
+COPY searxng-plugin/docker/dsh-entrypoint.sh /usr/local/bin/dsh-entrypoint
+RUN chmod +x /usr/local/bin/dsh-entrypoint
+
+# Instanz-URL; das Plugin liest sie, wenn im Profil keine baseURL steht.
+ENV SEARXNG_BASE_URL=http://10.1.1.11:4002
+
+# Profil schon im Image vorbereiten (greift, wenn /root/.dsh NICHT gemountet
+# wird; bei gemountetem Volume repariert der Entrypoint die Verlinkung).
+RUN dsh plugin --profile web add /opt/dsh-plugins/searxng
+
+RUN mkdir -p /root/.dsh && chmod -R 777 /root
+
+ENV HOME=/root
+WORKDIR /root
+EXPOSE 3082
+
+ENTRYPOINT ["/usr/local/bin/dsh-entrypoint"]
+CMD ["dsh", "web", "--port", "3082", "--trusted-host", "localhost", "--trusted-host", "127.0.0.1", "--trusted-host", "10.1.1.16", "--no-open"]

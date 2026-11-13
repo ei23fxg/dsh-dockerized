@@ -1,0 +1,6 @@
+# Vom Build-Context ausschließen (klein halten)
+.git
+docs
+examples
+README.md
+TODO.md

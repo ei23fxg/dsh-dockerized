@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "Error: This script requires bash. Please run with: bash $0" >&2
+    exit 1
+fi
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# dsh-dockerized — DeepSeek Harness im Docker-Container
+# Konzept analog zu pi-mono-dockerized: ein selbstständiges Bash-Setup.
+#   * Image enthält die Toolchain + DSH selbst (npm -g ins Image)
+#   * Konfiguration, Sessions, Patches bleiben im Host-~/.dsh
+#   * festes Arbeits-Home (~/dsh-home) oder per -m gemountetes Projekt
+#   * Web-UI (Standard) und headless CLI; Session-Isolation pro Kontext
+# ---------------------------------------------------------------------------
+
+# --- Konfiguration ---
+DSHD_SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+CURRENT_DIR_HASH=$(printf '%s' "$PWD" | md5sum | cut -d' ' -f1)
+CURRENT_DIR_HASH_SHORT="${CURRENT_DIR_HASH: -6}"
+PROJECT_NAME="$(basename "$(pwd)")"
+# Containereigener Projektname: nur ASCII [A-Za-z0-9._-], damit die Session-
+# Ordner-Key-Berechnung unten exakt der von DSH entspricht (projectKey in
+# dsh-session-persistence-jsonl: "/" "\" ":" -> "-", andere unsichere Zeichen
+# -> "~XXXX"; ohne ASCII-Einschränkung würde der Host-Name dort escapen).
+PROJECT_SAFE_NAME="$(printf '%s' "$PROJECT_NAME" | LC_ALL=C tr -cs 'A-Za-z0-9._-' '_')"
+DSHD_WORK_DIR="/${PROJECT_SAFE_NAME}_${CURRENT_DIR_HASH_SHORT}"
+
+DSHD_IMAGE="dsh-dockerized:latest"
+DSHD_CACHE_VOLUME="dsh-dockerized-cache"
+DSHD_CONTAINER_NAME_PREFIX="dsh-"
+DSHD_CONTAINER_NAME="${DSHD_CONTAINER_NAME_PREFIX}${CURRENT_DIR_HASH}"
+
+# Container-Seite: immer user-UID/GID mit HOME=/home/hostuser; ~/.dsh spiegelt
+# das Host-~/.dsh (Profiles, Sessions, Patches, Skills, Attachments).
+DSHD_CONTAINER_HOME="/home/hostuser"
+DSHD_FOLDER="$HOME/.dsh"
+DSHD_CONFIG_CONTAINER="$DSHD_CONTAINER_HOME/.dsh"
+DSHD_CACHE_CONTAINER="/opt/dsh-cache"
+DSHD_MOUNTS_FILE="${DSHD_MOUNTS_FILE:-${DSHD_FOLDER}/mounts.conf}"
+
+# Festes Arbeits-Home (Start ohne -m). Wird über einen verwalteten Eintrag in
+# mounts.conf nach $DSHD_CONTAINER_HOME/dsh-home gemountet.
+DSHD_HOME_DIR="${DSHD_HOME_DIR:-$HOME/dsh-home}"
+DSHD_HOME_CONTAINER="$DSHD_CONTAINER_HOME/dsh-home"
+DSHD_HOME_HASH=$(printf '%s' "$DSHD_HOME_DIR" | md5sum | cut -d' ' -f1)
+DSHD_HOME_ID="${DSHD_HOME_HASH: -6}"
+DSHD_HOME_CONTAINER_NAME="dsh-home-${DSHD_HOME_ID}"
+
+# "dsh -m" mountet das aktuelle Verzeichnis; "dsh -m DATEI..." nur diese Dateien.
+DSHD_MOUNT_CWD="${DSHD_MOUNT_CWD:-0}"
+DSHD_SELECTIVE=0
+DSHD_MOUNT_FILE_HOSTS=()
+DSHD_MOUNT_FILE_TARGETS=()
+
+# DSH-Version im Image (floating: latest). Update = "dsh rebuild".
+DSHD_VERSION="${DSHD_VERSION:-latest}"
+# Rust-Version für das Image (z. B. DSHD_RUST_VERSION=1.83)
+DSHD_RUST_VERSION="${DSHD_RUST_VERSION:-stable}"
+# Ändert sich der Stamp, wird das Image automatisch neu gebaut.
+DSHD_BUILD_STAMP="1-${DSHD_VERSION}-${DSHD_RUST_VERSION}"
+
+# Web-UI (Standardstart): fester Port; Host-Network, URL erscheint im Terminal.
+DSHD_PORT="${DSHD_PORT:-3080}"
+DSHD_OPEN_BROWSER="${DSHD_OPEN_BROWSER:-0}"
+
+# .git ist standardmäßig sichtbar (lokale Commits des Agenten).
+DSHD_ALLOW_GIT="${DSHD_ALLOW_GIT:-1}"
+# Repo ohne Historie: beim vollen Projekt-Mount einmalig git init + Snapshot.
+DSHD_GIT_AUTOINIT="${DSHD_GIT_AUTOINIT:-1}"
+# "dsh --show-hidden": standardmäßig versteckte Projektdateien sichtbar.
+DSHD_SHOW_HIDDEN="${DSHD_SHOW_HIDDEN:-0}"
+
+# Git-Identität aus der Host-Konfiguration (ohne kann git nicht committen).
+DSHD_GIT_NAME="${DSHD_GIT_NAME:-$(git config --global user.name 2>/dev/null || true)}"
+DSHD_GIT_EMAIL="${DSHD_GIT_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
+
+# API-Keys: Dateien ~/.dsh/<NAME> (chmod 600 empfohlen) oder bereits gesetzte
+# Host-Umgebungsvariablen werden in den Container gereicht.
+DSHD_API_KEY_FILES=(DEEPSEEK_API_KEY STRATA_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GROQ_API_KEY XAI_API_KEY HF_TOKEN GH_TOKEN GITHUB_TOKEN)
+# Host-Umgebungsvariablen, die durchgereicht werden, wenn sie gesetzt sind
+# (DB-* wie im alten Compose-Setup; eigene Namen anhängbar).
+DSHD_EXTRA_ENV="${DSHD_EXTRA_ENV:-DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME}"
+
+# Datenschutz: Telemetrie aus (der Rest läuft über ~/.dsh/cordis.patch.yml,
+# siehe examples/dsh/cordis.patch.yml — deaktiviert zusätzlich die OTel-Rows).
+DSHD_TELEMETRY_ENV=(
+    -e "DSH_TELEMETRY_DISABLED=1"
+    -e "DSH_TELEMETRY_MODE=DISABLED"
+    -e "DO_NOT_TRACK=1"
+    -e "NPM_CONFIG_UPDATE_NOTIFIER=false"
+)
+
+# Caches (npm/pnpm/uv) ins persistente Volume statt ins flüchtige Container-$HOME.
+DSHD_CACHE_ENV=(
+    -e "NPM_CONFIG_CACHE=$DSHD_CACHE_CONTAINER/npm"
+    -e "npm_config_cache=$DSHD_CACHE_CONTAINER/npm"
+    -e "NPM_CONFIG_STORE_DIR=$DSHD_CACHE_CONTAINER/pnpm"
+    -e "npm_config_store_dir=$DSHD_CACHE_CONTAINER/pnpm"
+    -e "UV_CACHE_DIR=$DSHD_CACHE_CONTAINER/uv"
+)
+
+# DSH läuft immer im Docker-Host-Netzwerk, damit die Web-UI-URL
+# (127.0.0.1:PORT im Container) direkt vom Host-Browser geöffnet werden kann.
+DSHD_NETWORK_MODE="host"
+
+DSHD_DEFAULT_IGNORED_FILES=(.env .deploy .secret .git .build .vscode .gitmodules .gitignore .dsh .aiignore .aiexclude .copilotignore .geminiignore .codeiumignore .cursorignore .DS_Store)
+DSHD_EMPTY_DIR=$(mktemp -d)
+# Temporärer Sessions-Root, der nur das aktuelle Projekt enthält: über das
+# Mount von ~/.dsh/sessions gelegt, damit andere Projekte unsichtbar bleiben
+# (DSHs Web-UI listet Sessions nach Projektordner-Key).
+DSHD_SESSION_PARENT=$(mktemp -d)
+# Enthält nur die Projektordner selektiver Datei-Mounts + eigener Session-Root.
+DSHD_FILES_ROOT=$(mktemp -d)
+DSHD_SELECTIVE_SESSION_PARENT=$(mktemp -d)
+
+# shellcheck disable=SC2329  # wird über `trap cleanup EXIT` aufgerufen
+cleanup() {
+    rm -rf "$DSHD_EMPTY_DIR" "$DSHD_SESSION_PARENT" "$DSHD_SELECTIVE_SESSION_PARENT" "$DSHD_FILES_ROOT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Helper: Session-Ordner-Key wie DSH (projectKey, dsh-session-persistence-jsonl)
+# Separator-Läufe (/ \ :) -> "-", führende "-" ab, wrap in --...--
+# Nur relevant für die ASCII-only-Containerpfade dieses Wrappers.
+# ---------------------------------------------------------------------------
+dshd_session_key() {
+    local path="$1" readable
+    # Wie projectKey(): Separator-Läufe -> "-", führende "-" komplett ab,
+    # leer -> "root", Kürzung auf 251, Wrap in --...--
+    readable="$(printf '%s' "$path" | sed -E 's~[\\/::]+~-~g; s/^-+//')"
+    [[ -z "$readable" ]] && readable="root"
+    printf -- '--%s--' "${readable:0:251}"
+}
+
+DSHD_WORK_SESSION_KEY="$(dshd_session_key "$DSHD_WORK_DIR")"
+DSHD_HOME_SESSION_KEY="$(dshd_session_key "$DSHD_HOME_CONTAINER")"
+DSHD_HOME_SESSION_DIR="${DSHD_FOLDER}/sessions/${DSHD_HOME_SESSION_KEY}"
+mkdir -p "${DSHD_SESSION_PARENT}/${DSHD_WORK_SESSION_KEY}" "${DSHD_HOME_SESSION_DIR}"
+
+# ---------------------------------------------------------------------------
+# Helper: Docker Image bauen (Dockerfile ist ins Skript eingebettet;
+# Build-Kontext ist dieses Verzeichnis, damit das SearXNG-Plugin COPYt werden kann)
+# ---------------------------------------------------------------------------
+build_image() {
+    echo "Building dsh base image (DSH: ${DSHD_VERSION}, Rust: ${DSHD_RUST_VERSION})..."
+    local temp_build_dir plugin_copy=""
+    temp_build_dir=$(mktemp -d)
+
+    # Plugin ins Image backen (nicht in den Workspace): nur wenn der Ordner
+    # existiert, sonst ohne SearXNG bauen (dsh-entrypoint prüft das zur Laufzeit).
+    if [[ -d "${DSHD_SCRIPT_DIR}/dsh-plugins/searxng" ]]; then
+        plugin_copy=$'COPY dsh-plugins/searxng /opt/dsh-plugins/searxng'
+    fi
+
+    cat > "${temp_build_dir}/Dockerfile" <<EOF
+FROM node:22-bookworm-slim
+
+# Grundlegende System- & Dev-Tools
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \\
+    bash openssh-server curl wget git gh make gcc g++ gawk ripgrep jq ca-certificates \\
+    less procps unzip zip shellcheck \\
+    ffmpeg imagemagick pandoc \\
+    python3 python3-pip python3-venv python3-full \\
+    golang \\
+    php-cli php-mbstring php-xml php-curl php-mysql php-zip composer \\
+    default-mysql-client \\
+    pkg-config libssl-dev cmake clang lld libclang-dev zlib1g-dev \\
+    && rm -rf /var/lib/apt/lists/*
+
+# python -> python3 (Kompatibilität für Tools/Install-Skripte)
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# pnpm + DSH ins Image (Update: "dsh rebuild" mit neuem DSHD_VERSION)
+ARG DSH_VERSION=${DSHD_VERSION}
+RUN npm install -g pnpm@latest "@deepseek-ai/dsh@\${DSH_VERSION}"
+
+# Rust systemweit über rustup
+ARG RUST_VERSION=${DSHD_RUST_VERSION}
+ENV RUSTUP_HOME=/usr/local/rustup \\
+    CARGO_HOME=/usr/local/cargo \\
+    PATH="/usr/local/cargo/bin:\${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "\${RUST_VERSION}" \\
+    && rustup component add rustfmt clippy \\
+    && chmod -R a+w /usr/local/rustup /usr/local/cargo \\
+    && rustc --version && cargo --version
+
+# uv (Python-Paketmanager)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# SearXNG-Suchplugin + Profil-Reparatur-Skript fest ins Image
+${plugin_copy}
+COPY docker/dsh-entrypoint.sh /usr/local/bin/dsh-entrypoint
+RUN chmod +x /usr/local/bin/dsh-entrypoint
+
+# Nicht-Root-Containerbenutzer (Host-UID/GID): HOME und Cache-Verzeichnisse
+RUN mkdir -p $DSHD_CONTAINER_HOME $DSHD_CACHE_CONTAINER/npm $DSHD_CACHE_CONTAINER/pnpm $DSHD_CACHE_CONTAINER/uv \\
+    && chmod -R 777 $DSHD_CONTAINER_HOME $DSHD_CACHE_CONTAINER \\
+    && chmod 777 /
+
+ENV HOME=$DSHD_CONTAINER_HOME \\
+    DSH_HOME=$DSHD_CONFIG_CONTAINER
+WORKDIR $DSHD_CONTAINER_HOME
+EOF
+    docker build \
+        --label "dsh-dockerized.build.stamp=${DSHD_BUILD_STAMP}" \
+        --label "dsh-dockerized.managed=true" \
+        --build-arg "DSH_VERSION=${DSHD_VERSION}" \
+        --build-arg "RUST_VERSION=${DSHD_RUST_VERSION}" \
+        -t "${DSHD_IMAGE}" \
+        -f "${temp_build_dir}/Dockerfile" \
+        "${DSHD_SCRIPT_DIR}"
+    rm -rf "${temp_build_dir}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: Host-Konfiguration in ~/.dsh anlegen (nichts überschreiben)
+# ---------------------------------------------------------------------------
+seed_dsh_config() {
+    local example_dir="${DSHD_SCRIPT_DIR}/examples/dsh"
+    [[ -d "${example_dir}" ]] || { echo "Warning: ${example_dir} not found; DSH config was not seeded." >&2; return; }
+
+    mkdir -p "${DSHD_FOLDER}/sessions"
+    [[ -f "${DSHD_FOLDER}/cordis.patch.yml" ]] || cp "${example_dir}/cordis.patch.yml" "${DSHD_FOLDER}/cordis.patch.yml"
+    [[ -f "${DSHD_FOLDER}/AGENTS.md" ]] || cp "${example_dir}/AGENTS.md" "${DSHD_FOLDER}/AGENTS.md"
+    [[ -f "${DSHD_MOUNTS_FILE}" ]] || cp "${example_dir}/mounts.conf" "${DSHD_MOUNTS_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: festes Arbeits-Home in mounts.conf sicherstellen
+# ---------------------------------------------------------------------------
+ensure_home_mount() {
+    mkdir -p "$(dirname "${DSHD_MOUNTS_FILE}")" 2>/dev/null || true
+    touch "${DSHD_MOUNTS_FILE}" 2>/dev/null || true
+    if [[ ! -f "${DSHD_MOUNTS_FILE}" ]]; then
+        echo "Error: ${DSHD_MOUNTS_FILE} is not a writable file." >&2
+        return 1
+    fi
+
+    local line host_path rest target mode
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "${line}" || "${line}" == \#* || "${line}" != *:* ]] && continue
+
+        line="${line/#\~/$HOME}"
+        host_path="${line%%:*}"
+        rest="${line#*:}"
+        target="${rest%%:*}"
+        mode=""
+        [[ "${rest}" == *:* ]] && mode="${rest#*:}"
+
+        if [[ "${target}" == "${DSHD_HOME_CONTAINER}" ]]; then
+            if [[ "${host_path}" != /* ]]; then
+                echo "Warning: dsh-home mount has a relative host path: ${line}" >&2
+                continue
+            fi
+            if [[ -n "${mode}" && "${mode}" != "ro" && "${mode}" != "rw" ]]; then
+                echo "Warning: dsh-home mount has an unsupported mode: ${line}" >&2
+            fi
+            mkdir -p "${host_path}" 2>/dev/null || true
+            if [[ "${mode}" == "ro" ]]; then
+                echo "Warning: dsh-home is mounted read-only (${line}); DSH cannot persist files there." >&2
+            fi
+            return
+        fi
+    done < "${DSHD_MOUNTS_FILE}"
+
+    mkdir -p "${DSHD_HOME_DIR}"
+    if ! printf '\n# Managed by dsh-dockerized: fixed working home\n%s:%s\n' "${DSHD_HOME_DIR}" "${DSHD_HOME_CONTAINER}" >> "${DSHD_MOUNTS_FILE}"; then
+        echo "Error: could not add the dsh-home mount to ${DSHD_MOUNTS_FILE}." >&2
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: zusätzliche permanente Mounts aus ~/.dsh/mounts.conf
+# ---------------------------------------------------------------------------
+add_extra_mounts() {
+    [[ -f "${DSHD_MOUNTS_FILE}" ]] || return
+
+    local line host_path container_spec container_path mode
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
+
+        line="${line/#\~/$HOME}"
+
+        if [[ "${line}" != *:* ]]; then
+            echo "Warning: ignoring mount without container path: ${line}" >&2
+            continue
+        fi
+        host_path="${line%%:*}"
+        container_spec="${line#*:}"
+        container_path="${container_spec%%:*}"
+        mode=""
+        if [[ "${container_spec}" == *:* ]]; then
+            mode="${container_spec#*:}"
+        fi
+        if [[ "${host_path}" != /* ]]; then
+            echo "Warning: ignoring mount with relative host path: ${line}" >&2
+            continue
+        fi
+        if [[ "${container_path}" != /* ]]; then
+            echo "Warning: ignoring mount with relative container path: ${line}" >&2
+            continue
+        fi
+        if [[ ! -e "${host_path}" ]]; then
+            echo "Warning: ignoring mount with missing host path: ${host_path}" >&2
+            continue
+        fi
+        if [[ -n "${mode}" && "${mode}" != "ro" && "${mode}" != "rw" ]]; then
+            echo "Warning: ignoring mount with unsupported mode '${mode}': ${line}" >&2
+            continue
+        fi
+
+        case "${container_path}" in
+            "/"|"$DSHD_CONTAINER_HOME"|"$DSHD_CONFIG_CONTAINER"|"$DSHD_CONFIG_CONTAINER"/*|"$DSHD_CACHE_CONTAINER"|"$DSHD_CACHE_CONTAINER"/*|/opt/dsh-plugins|/opt/dsh-plugins/*|"$DSHD_WORK_DIR"|"$DSHD_WORK_DIR"/*)
+                echo "Warning: ignoring mount over reserved container path: ${container_path}" >&2
+                continue
+                ;;
+        esac
+
+        DOCKER_ARGS+=(-v "${line}")
+    done < "${DSHD_MOUNTS_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: selektive Datei-Mounts für "dsh -m DATEI..."
+# ---------------------------------------------------------------------------
+add_mount_file() {
+    local arg="$1" cwd_real real rel existing
+    cwd_real="$(pwd -P)"
+    real="$(readlink -f -- "${arg}" 2>/dev/null)" || return 1
+
+    if [[ "${cwd_real}" == "/" ]]; then
+        case "${real}" in
+            /*) ;;
+            *) echo "Error: ${arg} is outside the current directory." >&2; return 1 ;;
+        esac
+    else
+        case "${real}" in
+            "${cwd_real}"/*) ;;
+            *) echo "Error: ${arg} is outside the current directory." >&2; return 1 ;;
+        esac
+    fi
+
+    if [[ "${cwd_real}" == "/" ]]; then
+        rel="${real#/}"
+    else
+        rel="${real#"${cwd_real}"/}"
+    fi
+    if [[ -z "${rel}" || "${rel}" == *:* || "${rel}" == *$'\n'* ]]; then
+        echo "Error: ${arg} cannot be mounted (unsupported path)." >&2
+        return 1
+    fi
+
+    for existing in "${DSHD_MOUNT_FILE_TARGETS[@]}"; do
+        [[ "${existing}" == "${rel}" ]] && return 0
+    done
+
+    DSHD_MOUNT_FILE_HOSTS+=("${real}")
+    DSHD_MOUNT_FILE_TARGETS+=("${rel}")
+}
+
+setup_selective_mounts() {
+    local hash target
+    hash=$(printf '%s\n' "$PWD" "${DSHD_MOUNT_FILE_TARGETS[@]}" | md5sum | cut -d' ' -f1)
+
+    DSHD_SELECTIVE=1
+    DSHD_WORK_DIR="/${PROJECT_SAFE_NAME}_files_${hash: -6}"
+    DSHD_WORK_SESSION_KEY="$(dshd_session_key "$DSHD_WORK_DIR")"
+    DSHD_CONTAINER_NAME="dsh-files-${hash}"
+    mkdir -p "${DSHD_SELECTIVE_SESSION_PARENT}/${DSHD_WORK_SESSION_KEY}"
+
+    for target in "${DSHD_MOUNT_FILE_TARGETS[@]}"; do
+        mkdir -p "${DSHD_FILES_ROOT}/$(dirname -- "${target}")"
+        : > "${DSHD_FILES_ROOT}/${target}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Helper: Initialisierung (Image, Settings, Volume)
+# ---------------------------------------------------------------------------
+bootstrap_environment() {
+    local image_id image_stamp
+    image_id="$(docker images -q "${DSHD_IMAGE}" 2>/dev/null || true)"
+    image_stamp=""
+    if [[ -n "${image_id}" ]]; then
+        image_stamp="$(docker image inspect \
+            --format '{{ if .Config.Labels }}{{ index .Config.Labels "dsh-dockerized.build.stamp" }}{{ end }}' \
+            "${DSHD_IMAGE}" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${image_id}" ]]; then
+        echo "dsh: image ${DSHD_IMAGE} is missing; rebuilding."
+        echo "dsh: global 'docker image prune -a' or 'docker system prune -a' removes it between sessions."
+        build_image
+    elif [[ "${image_stamp}" != "${DSHD_BUILD_STAMP}" ]]; then
+        echo "dsh: image ${DSHD_IMAGE} has an old build stamp; rebuilding."
+        build_image
+    fi
+
+    seed_dsh_config
+    ensure_home_mount
+
+    docker volume create --label "dsh-dockerized.managed=true" "${DSHD_CACHE_VOLUME}" > /dev/null
+    docker run --rm -v "${DSHD_CACHE_VOLUME}:${DSHD_CACHE_CONTAINER}" "${DSHD_IMAGE}" \
+        chown "$(id -u):$(id -g)" "$DSHD_CACHE_CONTAINER" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Ausführung
+# ---------------------------------------------------------------------------
+# $1: Modus boot|raw | $2: Profilname (nur boot) | Rest: Argumente für dsh
+run_dsh() {
+    local mode="$1"
+    shift
+    local profile="${1:-web}"
+    [[ "$mode" == "boot" ]] && shift
+
+    bootstrap_environment
+
+    # Web-Standardflags: kein Browser-Open (Container), fester Port, Host-Localhost
+    local -a boot_args=("$@")
+    if [[ "$mode" == "boot" && "$profile" == "web" ]]; then
+        local has_port=0 arg
+        for arg in "${boot_args[@]}"; do
+            [[ "$arg" == "--port" ]] && has_port=1
+        done
+        [[ "$has_port" == "0" ]] && boot_args+=(--port "${DSHD_PORT}")
+        [[ "$DSHD_OPEN_BROWSER" != "1" ]] && boot_args+=(--no-open)
+        boot_args+=(--trusted-host localhost --trusted-host 127.0.0.1)
+    fi
+
+    local run_dir session_parent session_dir session_key container_name
+    if [[ "$mode" == "boot" ]]; then
+        if [[ "${DSHD_MOUNT_CWD}" == "1" ]]; then
+            run_dir="${DSHD_WORK_DIR}"
+            session_parent="${DSHD_SESSION_PARENT}"
+            session_dir="${DSHD_FOLDER}/sessions/${DSHD_WORK_SESSION_KEY}"
+            [[ "${DSHD_SELECTIVE}" == "1" ]] && session_parent="${DSHD_SELECTIVE_SESSION_PARENT}"
+            session_key="${DSHD_WORK_SESSION_KEY}"
+            container_name="${DSHD_CONTAINER_NAME}"
+            mkdir -p "${session_dir}"
+        else
+            run_dir="${DSHD_HOME_CONTAINER}"
+            session_parent=""
+            session_dir=""
+            session_key=""
+            container_name="${DSHD_HOME_CONTAINER_NAME}"
+        fi
+    fi
+
+    DOCKER_ARGS=(
+        --rm
+        -it
+        --network "${DSHD_NETWORK_MODE}"
+        --user "$(id -u):$(id -g)"
+        -e "HOME=${DSHD_CONTAINER_HOME}"
+        -e "DSH_HOME=${DSHD_CONFIG_CONTAINER}"
+        # Der entscheidende Mount: ~/.dsh spiegeln (Profiles, Patches, Sessions)
+        -v "${DSHD_FOLDER}:${DSHD_CONFIG_CONTAINER}"
+        # Caches (npm/pnpm/uv) persistent
+        -v "${DSHD_CACHE_VOLUME}:${DSHD_CACHE_CONTAINER}"
+        "${DSHD_TELEMETRY_ENV[@]}"
+        "${DSHD_CACHE_ENV[@]}"
+    )
+
+    # Zeitzone wie auf dem Host
+    [[ -e /etc/localtime ]] && DOCKER_ARGS+=(-v "/etc/localtime:/etc/localtime:ro")
+    [[ -e /etc/timezone ]] && DOCKER_ARGS+=(-v "/etc/timezone:/etc/timezone:ro")
+
+    # API-Keys: Dateien ~/.dsh/<NAME> schlagen Host-Umgebung
+    local key key_file
+    for key in "${DSHD_API_KEY_FILES[@]}"; do
+        key_file="${DSHD_FOLDER}/${key}"
+        if [[ -f "${key_file}" ]]; then
+            DOCKER_ARGS+=(-e "${key}=$(cat "${key_file}")")
+        elif [[ -n "${!key:-}" ]]; then
+            DOCKER_ARGS+=(-e "${key}")
+        fi
+    done
+
+    # Host-Umgebungsvariablen (DB-* etc.) durchreichen, wenn gesetzt
+    local name
+    for name in ${DSHD_EXTRA_ENV}; do
+        [[ -n "${!name:-}" ]] && DOCKER_ARGS+=(-e "${name}")
+    done
+
+    if [[ "$mode" == "raw" ]]; then
+        # Plugin-/Konfigurationsverwaltung: kein Workspace-Mount, kein Profil-Fix
+        docker run "${DOCKER_ARGS[@]}" "${DSHD_IMAGE}" \
+            /bin/sh -c 'exec dsh "$@"' sh "$@"
+        return
+    fi
+
+    DOCKER_ARGS+=(--name "${container_name}")
+
+    # Sessions: im Projektmodus nur die des aktuellen Kontexts sichtbar
+    if [[ -n "${session_parent}" ]]; then
+        DOCKER_ARGS+=(-v "${session_parent}:${DSHD_CONFIG_CONTAINER}/sessions")
+        DOCKER_ARGS+=(-v "${session_dir}:${DSHD_CONFIG_CONTAINER}/sessions/${session_key}")
+    fi
+
+    # Git-Identität immer durchreichen (sonst kann git nicht committen)
+    local git_name="${DSHD_GIT_NAME:-DSH Agent}" git_email="${DSHD_GIT_EMAIL:-agent@dsh-dockerized.local}"
+    DOCKER_ARGS+=(-e "GIT_AUTHOR_NAME=${git_name}" -e "GIT_COMMITTER_NAME=${git_name}"
+        -e "GIT_AUTHOR_EMAIL=${git_email}" -e "GIT_COMMITTER_EMAIL=${git_email}")
+
+    # Git-Auto-Init nur bei vollem Projekt-Mount
+    if [[ "${DSHD_MOUNT_CWD}" == "1" && "${DSHD_SELECTIVE}" != "1" && "${DSHD_ALLOW_GIT}" == "1" && "${DSHD_GIT_AUTOINIT}" == "1" ]]; then
+        DOCKER_ARGS+=(-e "DSHD_GIT_AUTOINIT=1")
+    fi
+
+    # Arbeitsverzeichnis: nur mit -m gemountet (voll oder selektiv)
+    if [[ "${DSHD_MOUNT_CWD}" == "1" ]]; then
+        if [[ "${DSHD_SELECTIVE}" == "1" ]]; then
+            DOCKER_ARGS+=(-v "${DSHD_FILES_ROOT}:${DSHD_WORK_DIR}")
+            local i
+            for ((i = 0; i < ${#DSHD_MOUNT_FILE_HOSTS[@]}; i++)); do
+                DOCKER_ARGS+=(-v "${DSHD_MOUNT_FILE_HOSTS[$i]}:${DSHD_WORK_DIR}/${DSHD_MOUNT_FILE_TARGETS[$i]}")
+            done
+        else
+            DOCKER_ARGS+=(-v "$(pwd):${DSHD_WORK_DIR}")
+
+            # Versteckte Dateien via /dev/null-Mounts verbergen (wie beim Pi-Wrapper)
+            if [[ "${DSHD_SHOW_HIDDEN}" != "1" ]]; then
+                local -a ignored_files=()
+                for file in "${DSHD_DEFAULT_IGNORED_FILES[@]}"; do
+                    if [[ "${DSHD_ALLOW_GIT}" == "1" && ( "$file" == ".git" || "$file" == ".gitignore" || "$file" == ".gitmodules" ) ]]; then
+                        continue
+                    fi
+                    ignored_files+=("$file")
+                done
+                for file in "${ignored_files[@]}"; do
+                    if [[ -d "./$file" ]]; then
+                        DOCKER_ARGS+=(-v "${DSHD_EMPTY_DIR}:${DSHD_WORK_DIR}/$file")
+                    elif [[ -f "./$file" ]]; then
+                        DOCKER_ARGS+=(-v "/dev/null:${DSHD_WORK_DIR}/$file")
+                    fi
+                done
+            fi
+        fi
+    fi
+
+    # Zusätzliche permanente Mounts aus ~/.dsh/mounts.conf
+    add_extra_mounts
+
+    docker rm -f "${container_name}" 2>/dev/null || true
+
+    # Startbefehl: Profil-Fix (SearXNG) + Git-Auto-Init + exec dsh.
+    # Argumente bleiben echte Argumente (Leerzeichen/Quotes in Prompts ok).
+    docker run "${DOCKER_ARGS[@]}" "${DSHD_IMAGE}" \
+        /bin/sh -c 'cd "$1" || exit 1
+shift
+profile="$1"
+shift
+if [ "${DSHD_GIT_AUTOINIT:-0}" = 1 ] && [ ! -d .git ]; then
+    git init -q >/dev/null 2>&1 && git add -A && git commit -qm "checkpoint: initial workspace snapshot" >/dev/null 2>&1 || true
+fi
+if [ -x /usr/local/bin/dsh-entrypoint ]; then
+    DSH_FIX_PROFILE="$profile" exec /usr/local/bin/dsh-entrypoint dsh --profile "$profile" "$@"
+else
+    exec dsh --profile "$profile" "$@"
+fi' sh "${run_dir}" "${profile}" "${boot_args[@]}"
+}
+
+# --- Routing ---
+DSHD_COMMAND="${1:-}"
+while [[ -n "${DSHD_COMMAND}" ]]; do
+    case "${DSHD_COMMAND}" in
+        -m|--mount)
+            DSHD_MOUNT_CWD=1
+            shift
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        break
+                        ;;
+                    web)
+                        # "web" ist der Web-Kurzstart, kein Dateipfad.
+                        # Ein Projektordner namens "web" lässt sich mit ./web mounten.
+                        break
+                        ;;
+                esac
+                if [[ -d "$1" ]]; then
+                    echo "Error: 'dsh -m $1' is not supported. Use 'dsh -m' without file arguments for the whole directory." >&2
+                    exit 1
+                fi
+                if [[ -f "$1" ]]; then
+                    add_mount_file "$1" || exit 1
+                    shift
+                    continue
+                fi
+                break
+            done
+            if (( ${#DSHD_MOUNT_FILE_HOSTS[@]} > 0 )); then
+                setup_selective_mounts
+            fi
+            DSHD_COMMAND="${1:-}"
+            ;;
+        --show-hidden|show-hidden)
+            DSHD_SHOW_HIDDEN=1
+            shift
+            DSHD_COMMAND="${1:-}"
+            ;;
+        rebuild)
+            docker rmi "${DSHD_IMAGE}" 2>/dev/null || true
+            shift
+            DSHD_COMMAND="${1:-}"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# --- Modus wählen ---
+DSHD_FIRST="${1:-}"
+
+if [[ $# -eq 0 ]]; then
+    # Standard: Web-UI im festen Home (bzw. Projekt bei -m)
+    run_dsh boot web
+    exit $?
+fi
+
+case "${DSHD_FIRST}" in
+    web)
+        shift
+        run_dsh boot web "$@"
+        exit $?
+        ;;
+    headless)
+        shift
+        run_dsh boot headless "$@"
+        exit $?
+        ;;
+    plugin)
+        run_dsh raw "$@"
+        exit $?
+        ;;
+    -*)
+        # Launcher-Flags/-Help direkt im Container ausführen (kein Workspace)
+        run_dsh raw "$@"
+        exit $?
+        ;;
+    *)
+        # Eigenes Profil (z. B. tui, rescue, ...) — App-Argumente folgen danach
+        DSHD_PROFILE="${DSHD_FIRST}"
+        shift
+        run_dsh boot "${DSHD_PROFILE}" "$@"
+        exit $?
+        ;;
+esac
