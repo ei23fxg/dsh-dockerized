@@ -62,8 +62,8 @@ different ports (`DSHD_PORT=3081 dsh -m web`).
 - A full `-m` project hides `.env`, `.secret`, `.deploy`, `.build`, `.vscode`, various ignore files
   and a project-local `.dsh/` (via `/dev/null`/empty-directory mounts). `.git`, `.gitignore` and
   `.gitmodules` are visible — `DSHD_ALLOW_GIT=0` hides them too.
-- Telemetry off: `DSH_TELEMETRY_*` flags plus disabled OTel/analytics rows in
-  `~/.dsh/cordis.patch.yml` (see [`examples/dsh/cordis.patch.yml`](examples/dsh/cordis.patch.yml)).
+- Telemetry off by default: wrapper env flags plus component-level kills in the home patch —
+  details in [Disabling telemetry — completely](#disabling-telemetry--completely).
 
 ## Configuration
 
@@ -123,6 +123,57 @@ export DSHD_ALLOW_GIT=0    # all future starts
 | `DSHD_EXTRA_ENV` | `DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME` | host env var names to pass through |
 | `DSHD_VERSION` | `latest` | DSH version baked into the image (change ⇒ rebuild) |
 | `DSHD_RUST_VERSION` | `stable` | Rust toolchain in the image (change ⇒ rebuild) |
+
+## Disabling telemetry — completely
+
+Two layers. The wrapper already sets up **both** by default; on an existing `~/.dsh` only layer 2
+may need the block added manually.
+
+**1. Environment variables** — the wrapper passes these into *every* container start:
+
+```bash
+DSH_TELEMETRY_DISABLED=1    # DSH: hard off
+DSH_TELEMETRY_MODE=DISABLED # DSH: mode switch
+DO_NOT_TRACK=1              # honored by many other CLIs too
+NPM_CONFIG_UPDATE_NOTIFIER=false
+```
+
+These are hardcoded, not user-overridable host env — if you ever want a flag back
+deliberately, list its name in `DSHD_EXTRA_ENV`: pass-through `-e` args are appended
+*after* the defaults, so they win, e.g.
+`DSHD_EXTRA_ENV="$DSHD_EXTRA_ENV DSH_TELEMETRY_MODE" DSH_TELEMETRY_MODE=ENABLED dsh …`.
+
+**2. Component kills in the home patch** — env flags silence the transport; this list additionally
+unloads the telemetry components themselves (nothing loaded, nothing registered). It is seeded
+automatically into a fresh `~/.dsh/cordis.patch.yml` (full template:
+[`examples/dsh/cordis.patch.yml`](examples/dsh/cordis.patch.yml)); if your file predates this repo,
+append the block:
+
+```yaml
+# privacy: kill telemetry/analytics completely
+- id: session-telemetry-otel
+  disabled: true
+- id: otel                              # shared OTLP transport
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek # attaches plugin list to requests
+  disabled: true
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true
+- id: command-feedback                  # optional; removes the rating buttons
+  disabled: true
+- id: message-feedback
+  disabled: true
+- id: ui-message-feedback
+  disabled: true
+```
+
+The home patch applies to **all profiles**, so this holds for web, headless and custom profiles
+alike. Remember: a patch entry replaces the whole config of that row — keep other settings of a
+disabled id's row in mind when reordering your patch file.
 
 ## Image & updates
 
