@@ -61,7 +61,9 @@ DSHD_VERSION="${DSHD_VERSION:-latest}"
 # Rust-Version für das Image (z. B. DSHD_RUST_VERSION=1.83)
 DSHD_RUST_VERSION="${DSHD_RUST_VERSION:-stable}"
 # Ändert sich der Stamp, wird das Image automatisch neu gebaut.
-DSHD_BUILD_STAMP="1-${DSHD_VERSION}-${DSHD_RUST_VERSION}"
+# Stamp-Präfix = Dockerfile-Revision (2: explizite chmod-755 für Entrypoint/Plugin,
+# davor konnte ein 711/600-Build-Kontext den Entrypoint im Image unlesepbar machen).
+DSHD_BUILD_STAMP="2-${DSHD_VERSION}-${DSHD_RUST_VERSION}"
 
 # Web-UI (Standardstart): fester Port; Host-Network, URL erscheint im Terminal.
 DSHD_PORT="${DSHD_PORT:-3080}"
@@ -196,7 +198,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # SearXNG-Suchplugin + Profil-Reparatur-Skript fest ins Image
 ${plugin_copy}
 COPY docker/dsh-entrypoint.sh /usr/local/bin/dsh-entrypoint
-RUN chmod +x /usr/local/bin/dsh-entrypoint
+# Explizit 755/a+rX: docker COPY übernimmt die Build-Kontext-Modi (711/600 von
+# restriktiven umasks), chmod +x ergänzt nie die Lesebits — ohne Read kann der
+# Nicht-Root-User den Entrypoint nicht ausführen (Permission denied).
+RUN chmod 755 /usr/local/bin/dsh-entrypoint \\
+    && if [ -d /opt/dsh-plugins/searxng ]; then chmod -R a+rX /opt/dsh-plugins/searxng; fi
 
 # Nicht-Root-Containerbenutzer (Host-UID/GID): HOME und Cache-Verzeichnisse
 RUN mkdir -p $DSHD_CONTAINER_HOME $DSHD_CACHE_CONTAINER/npm $DSHD_CACHE_CONTAINER/pnpm $DSHD_CACHE_CONTAINER/uv \\

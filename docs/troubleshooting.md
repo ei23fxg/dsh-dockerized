@@ -12,6 +12,12 @@
   `docker system prune -a` oder `docker volume prune`. Beheben: einmal
   `dsh rebuild`; künftig nur gezielt prunen — Image und Volume tragen das
   Label `dsh-dockerized.managed=true`.
+- **`/bin/sh: 0: cannot open /usr/local/bin/dsh-entrypoint: Permission denied`:**
+  Das Image wurde aus einem Build-Kontext mit restriktiven Dateirechten gebaut
+  (Entrypoint ohne Lesebits, z. B. Modus 711). Behoben ab Build-Stamp `2-…`
+  (Dockerfile setzt jetzt explizit `chmod 755`/`a+rX`): Wrapper aktualisieren,
+  der nächste Start baut wegen Stamp-Wechsel automatisch neu (oder manuell
+  `dsh rebuild`).
 - **Erststart braucht Netz:** Das Web-Profil wird beim allerersten Boot
   automatisch initialisiert (`dsh plugin add` holt Abhängigkeiten), und der
   npm-Registry-Zugriff passiert während des Image-Baus.
