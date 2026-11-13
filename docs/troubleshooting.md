@@ -47,22 +47,21 @@
 
 ## Sessions & Isolation
 
-- **Web-UI zeigt im `-m` Sessions falsch/leer/gemischt (Stand vor 2026-11-13):**
-  Die Web-UI verwaltet ihre Sitzungs-Registry in
-  `~/.dsh/storages/workspace.json` (Workspaces + Session-Ids, keyed nach
-  Container-Pfad). Fixed-Home und `-m` teilten sich diese eine Datei: Der
-  `-m`-Start sah die Workspace-Einträge des Fixed-Homes, deren Session-Ordner
-  aber waren isoliert — die Liste wirkte defekt; bei Parallelbetrieb
-  überschrieben sich beide Instanzen in der Registry. Behoben: Jeder
-  `-m`-Kontext bekommt einen **eigenen persistenten** Storage unter
-  `~/.dsh/contexts/<session-key>/storages`, Sessions liegen wie gehabt in
-  `~/.dsh/sessions/<session-key>`. In `-m`-Kontexten vor dem Fix angelegte
-  Sessions wurden nie sauber persistiert und sind nicht rekonstruierbar.
-- **`-m` zeigt bewusst nur eigene Sessions:** Das ist Design wie beim
-  Pi-Wrapper — feste Home-World und jedes `-m`-Projekt sind getrennte
-  Welten (eigene Registry, eigener Sessions-Ausschnitt). Gewollte
-  Gesamtansicht → Festes Home verwenden und das Projekt via `mounts.conf`
-  mounten; dann erscheinen seine Sessions im Home-UI.
+- **`-m`-Sessions/Workspace-Ansicht war falsch (Stand vor 2026-11-13):**
+  `-m` mountete früher auf einen eigenen Container-Pfad (`/<Name>_<Hash>`)
+  und erhielt Web-Storage in `~/.dsh/contexts/` — DSH sah das als eigenen
+  Workspace, die Web-UI zeigte andere bzw. leere Einträge. Jetzt mountet
+  `-m` wie ein `mounts.conf`-Eintrag unter `/home/hostuser/<Ordnername>`:
+  gleicher Pfad ⇒ dieselben Sessions, dieselbe Registry wie ohne `-m`.
+  Altlasten können weg: `~/.dsh/contexts/` komplett sowie geleerte
+  `~/.dsh/sessions/--<Name>_<Hash>--/`-Ordner.
+- **Namens-Kollision beim `-m`-Mount:** Die `mounts.conf` mountet bereits einen
+  ANDEREN Ordner auf `/home/hostuser/<Ordnername>` → der Wrapper bricht mit
+  Fehlermeldung ab; Projektordner umbenennen oder `mounts.conf` anpassen.
+  IDENTISCHE Quelle ⇒ der vorhandene Mount wird einfach wiederverwendet.
+- **Parallelbetrieb:** Fixed-Home- und `-m`-Instanz teilen sich `~/.dsh`
+  (auch die Web-Registry). Der Wrapper prüft Hafen-Kollisionen; trotzdem
+  möglichst nur eine Web-Instanz gleichzeitig laufen lassen.
 - **Historie wirkt leer:** Sessions hängen am Workspace-Pfad
   (`~/.dsh/sessions/--<encodierter Pfad>--`). Projekt verschoben/umbenannt →
   neuer Key, alte Sessions bleiben unter dem alten Namen erhalten.
